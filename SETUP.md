@@ -20,9 +20,11 @@
    - Generate an API key
    - Copy it to your `.env` file
 
-4. **Set Bot Username**
-   - Use a unique username for your bot (e.g., "JudgmentalBot2024")
-   - This allows tracking performance separately
+4. **Set Designated Bot Username** ⚠️ **IMPORTANT**
+   - Use a **designated username for this task only** (e.g., "JudgmentalBot2024" or "MikhailTalBot2024")
+   - This username will be used to track overall performance
+   - The bot will use this username for all trades on Manifold Markets
+   - Make sure this username is unique and only used for this contest entry
 
 5. **Configure LLM (Required for intelligent analysis)**
    - For Google Gemini (default): Get API key from https://makersuite.google.com/app/apikey

@@ -36,29 +36,44 @@ class LLMAnalyzer:
             if self.provider == "gemini" and self.gemini_key:
                 import google.generativeai as genai
                 genai.configure(api_key=self.gemini_key)
-                # List available models and use the first one
-                try:
-                    models = genai.list_models()
-                    # Try to find a suitable model
-                    model_name = None
-                    for model in models:
-                        if 'generateContent' in model.supported_generation_methods:
-                            model_name = model.name
-                            break
-                    if model_name:
+                
+                # Use free-tier compatible models first (these have better quota limits)
+                # Priority order: free-tier friendly models first
+                free_tier_models = [
+                    'gemini-1.5-flash',           # Free tier, fast
+                    'gemini-flash-latest',        # Latest flash (usually free tier)
+                    'gemini-2.0-flash-lite',      # Lite version (free tier)
+                    'gemini-2.0-flash',           # Flash model
+                ]
+                
+                model_initialized = False
+                last_error = None
+                
+                for model_name in free_tier_models:
+                    try:
                         self._client = genai.GenerativeModel(model_name)
-                    else:
-                        # Fallback to gemini-1.5-flash
-                        self._client = genai.GenerativeModel('gemini-1.5-flash')
-                except Exception as e:
-                    logger.warning(f"Could not list models, using default: {e}")
-                    # Fallback to gemini-1.5-flash
+                        logger.info(f"Initialized Gemini with free-tier model: {model_name}")
+                        model_initialized = True
+                        break
+                    except Exception as e:
+                        last_error = e
+                        logger.debug(f"Could not use model {model_name}: {e}")
+                        continue
+                
+                if not model_initialized:
+                    logger.warning(f"Could not initialize free-tier models. Last error: {last_error}")
+                    logger.info("Gemini will work but may have quota limitations")
+                    # Try gemini-1.5-flash as last resort (most compatible)
                     try:
                         self._client = genai.GenerativeModel('gemini-1.5-flash')
-                    except Exception:
-                        # Last resort: try gemini-pro
-                        self._client = genai.GenerativeModel('gemini-pro')
-                logger.info("Google Gemini client initialized")
+                        logger.info("Initialized Gemini with gemini-1.5-flash (fallback)")
+                        model_initialized = True
+                    except Exception as e:
+                        logger.error(f"Failed to initialize Gemini: {e}")
+                        self._client = None
+                
+                if model_initialized:
+                    logger.info("Google Gemini client initialized successfully")
             elif self.provider == "openai" and self.openai_key:
                 import openai
                 self._client = openai.OpenAI(api_key=self.openai_key)
@@ -110,8 +125,17 @@ class LLMAnalyzer:
             
             return self._parse_response(response)
         except Exception as e:
-            logger.error(f"Error in LLM analysis: {e}")
-            return 0.5, 0.0, f"Analysis error: {str(e)}"
+            error_msg = str(e)
+            # Handle quota/rate limit errors specifically
+            if "quota" in error_msg.lower() or "429" in error_msg or "rate limit" in error_msg.lower():
+                logger.warning(f"Gemini API quota/rate limit exceeded: {error_msg[:100]}")
+                return 0.5, 0.0, "Gemini API quota exceeded - using fallback"
+            elif "ResourceExhausted" in str(type(e).__name__):
+                logger.warning(f"Gemini API resource exhausted: {error_msg[:100]}")
+                return 0.5, 0.0, "Gemini API resource exhausted - using fallback"
+            else:
+                logger.error(f"Error in LLM analysis: {e}")
+                return 0.5, 0.0, f"Analysis error: {str(e)[:100]}"
     
     def _build_analysis_prompt(self, question: str, description: str, 
                               current_prob: float, close_time: Optional[int]) -> str:
@@ -146,18 +170,25 @@ Respond in JSON format:
     
     def _analyze_with_gemini(self, prompt: str) -> str:
         """Analyze using Google Gemini API."""
+        if not self._client:
+            raise Exception("Gemini client not initialized")
+        
         full_prompt = f"""You are an expert prediction market analyst. Always respond with valid JSON.
 
 {prompt}"""
         
-        response = self._client.generate_content(
-            full_prompt,
-            generation_config={
-                "temperature": 0.7,
-                "max_output_tokens": 300,
-            }
-        )
-        return response.text
+        try:
+            response = self._client.generate_content(
+                full_prompt,
+                generation_config={
+                    "temperature": 0.7,
+                    "max_output_tokens": 300,
+                }
+            )
+            return response.text
+        except Exception as e:
+            # Re-raise to be handled by analyze_market
+            raise
     
     def _analyze_with_openai(self, prompt: str) -> str:
         """Analyze using OpenAI API."""

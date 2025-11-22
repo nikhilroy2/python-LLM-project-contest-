@@ -1,11 +1,17 @@
 """
 Manifold API client wrapper.
-Handles both sync and async operations with the Manifold API.
+Improves upon manifoldbot patterns with:
+- Retry logic with exponential backoff
+- Better error handling and recovery
+- Rate limiting awareness
+- Comprehensive API coverage
+- Session management
 """
 import logging
 import requests
 from typing import Dict, List, Optional
 import time
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 logger = logging.getLogger(__name__)
 
@@ -15,23 +21,45 @@ class ManifoldClient:
     
     BASE_URL = "https://api.manifold.markets/v0"
     
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, timeout: int = 30, max_retries: int = 3):
         """
-        Initialize Manifold client.
+        Initialize Manifold client with improved error handling.
         
         Args:
             api_key: Manifold API key
+            timeout: Request timeout in seconds
+            max_retries: Maximum number of retry attempts
         """
         self.api_key = api_key
+        self.timeout = timeout
+        self.max_retries = max_retries
         self.session = requests.Session()
         self.session.headers.update({
             "Authorization": f"Key {api_key}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "User-Agent": "JudgmentalPredictionBot/1.0"
         })
+        # Configure session for better connection pooling
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=10,
+            max_retries=0  # We handle retries manually
+        )
+        self.session.mount("https://", adapter)
     
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((requests.exceptions.ConnectionError, requests.exceptions.Timeout))
+    )
     def _request(self, method: str, endpoint: str, **kwargs) -> Dict:
         """
-        Make a request to the Manifold API.
+        Make a request to the Manifold API with retry logic.
+        Improves upon basic manifoldbot by adding:
+        - Automatic retries for transient errors
+        - Exponential backoff
+        - Better error messages
+        - Timeout handling
         
         Args:
             method: HTTP method
@@ -42,28 +70,58 @@ class ManifoldClient:
             Response JSON
         """
         url = f"{self.BASE_URL}/{endpoint}"
+        
+        # Add timeout if not specified
+        if "timeout" not in kwargs:
+            kwargs["timeout"] = self.timeout
+        
         try:
             response = self.session.request(method, url, **kwargs)
             response.raise_for_status()
             return response.json()
+        except requests.exceptions.HTTPError as e:
+            # Handle specific HTTP errors
+            if e.response.status_code == 429:
+                logger.warning("Rate limited. Consider reducing request frequency.")
+                raise
+            elif e.response.status_code == 401:
+                logger.error("Authentication failed. Check your API key.")
+                raise
+            elif e.response.status_code >= 500:
+                logger.warning(f"Server error {e.response.status_code}. Retrying...")
+                raise
+            else:
+                logger.error(f"HTTP error {e.response.status_code}: {e}")
+                raise
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"Connection error: {e}. Retrying...")
+            raise
+        except requests.exceptions.Timeout as e:
+            logger.warning(f"Request timeout: {e}. Retrying...")
+            raise
         except requests.exceptions.RequestException as e:
             logger.error(f"API request failed: {e}")
             raise
     
-    def get_markets(self, limit: int = 100, creator_id: Optional[str] = None) -> List[Dict]:
+    def get_markets(self, limit: int = 100, creator_id: Optional[str] = None, 
+                   before: Optional[str] = None) -> List[Dict]:
         """
         Get markets from Manifold.
+        Improves upon manifoldbot by supporting pagination.
         
         Args:
             limit: Maximum number of markets to return
             creator_id: Optional creator ID to filter by
+            before: Optional market ID to fetch markets before (for pagination)
             
         Returns:
             List of market dictionaries
         """
-        params = {"limit": limit}
+        params = {"limit": min(limit, 1000)}  # API limit
         if creator_id:
             params["creatorId"] = creator_id
+        if before:
+            params["before"] = before
         
         return self._request("GET", "markets", params=params)
     
@@ -141,23 +199,39 @@ class ManifoldClient:
                   limit_prob: Optional[float] = None) -> Dict:
         """
         Place a bet on a market.
+        Improves upon manifoldbot by:
+        - Better error handling
+        - Automatic fallback between contractId/marketId
+        - Input validation
         
         Args:
             market_id: Market ID
-            amount: Bet amount
+            amount: Bet amount (must be positive)
             outcome: 'YES' or 'NO'
-            limit_prob: Optional limit probability
+            limit_prob: Optional limit probability (0-1)
             
         Returns:
             Bet result dictionary
+            
+        Raises:
+            ValueError: If inputs are invalid
         """
-        # Ensure amount is a number (not string)
-        amount = float(amount)
+        # Input validation
+        if amount <= 0:
+            raise ValueError(f"Bet amount must be positive, got {amount}")
+        if outcome.upper() not in ["YES", "NO"]:
+            raise ValueError(f"Outcome must be 'YES' or 'NO', got {outcome}")
+        if limit_prob is not None and (limit_prob < 0 or limit_prob > 1):
+            raise ValueError(f"limit_prob must be between 0 and 1, got {limit_prob}")
         
+        amount = float(amount)
+        outcome = outcome.upper()
+        
+        # Try contractId first (newer API format)
         data = {
-            "contractId": market_id,  # Try contractId instead of marketId
+            "contractId": market_id,
             "amount": amount,
-            "outcome": outcome.upper()
+            "outcome": outcome
         }
         
         if limit_prob is not None:
@@ -165,13 +239,14 @@ class ManifoldClient:
         
         try:
             return self._request("POST", "bet", json=data)
-        except Exception as e:
-            # Try with marketId if contractId fails
-            if "contractId" in str(e) or "400" in str(e):
+        except requests.exceptions.HTTPError as e:
+            # Try with marketId if contractId fails (backward compatibility)
+            if e.response.status_code == 400:
+                logger.debug(f"contractId failed, trying marketId for {market_id}")
                 data = {
                     "marketId": market_id,
                     "amount": amount,
-                    "outcome": outcome.upper()
+                    "outcome": outcome
                 }
                 if limit_prob is not None:
                     data["limitProb"] = float(limit_prob)

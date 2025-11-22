@@ -76,23 +76,33 @@ class PerformanceTracker:
         self.current_balance = balance
         self._save_history()
     
-    def get_statistics(self) -> Dict:
-        """Get performance statistics."""
+    def get_statistics(self, resolution_metrics: Optional[Dict] = None) -> Dict:
+        """
+        Get performance statistics.
+        
+        Args:
+            resolution_metrics: Optional metrics from MarketResolutionTracker
+        """
         total_trades = len(self.trades) if self.trades else 0
         total_invested = sum(trade["amount"] for trade in self.trades) if self.trades else 0.0
         
-        # Calculate P&L (this would need market resolution data in real implementation)
-        # For now, we'll track open positions
-        total_pnl = 0.0
-        if self.starting_balance is not None and self.current_balance is not None:
-            total_pnl = self.current_balance - self.starting_balance
+        # Use resolution metrics if available, otherwise use balance difference
+        if resolution_metrics and resolution_metrics.get("total_resolved", 0) > 0:
+            total_pnl = resolution_metrics.get("total_pnl", 0.0)
+            win_rate = resolution_metrics.get("win_rate", 0.0)
+        else:
+            # Fallback to balance-based calculation
+            total_pnl = 0.0
+            if self.starting_balance is not None and self.current_balance is not None:
+                total_pnl = self.current_balance - self.starting_balance
+            win_rate = 0.0
         
-        roi = (total_pnl / self.starting_balance * 100) if self.starting_balance else 0.0
+        roi = (total_pnl / self.starting_balance * 100) if self.starting_balance and self.starting_balance > 0 else 0.0
         
         return {
             "total_trades": total_trades,
             "total_invested": total_invested,
-            "win_rate": 0.0,
+            "win_rate": win_rate,
             "total_pnl": total_pnl,
             "roi": roi,
             "current_balance": self.current_balance,
@@ -103,9 +113,9 @@ class PerformanceTracker:
         """Get most recent trades."""
         return self.trades[-n:] if self.trades else []
     
-    def print_summary(self):
+    def print_summary(self, resolution_metrics: Optional[Dict] = None):
         """Print performance summary."""
-        stats = self.get_statistics()
+        stats = self.get_statistics(resolution_metrics)
         print("\n" + "="*50)
         print("PERFORMANCE SUMMARY")
         print("="*50)

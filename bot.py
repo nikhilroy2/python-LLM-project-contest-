@@ -1,5 +1,32 @@
 """
 Main bot class that orchestrates market analysis, trading, and risk management.
+
+This bot improves upon the manifoldbot package patterns by:
+
+1. Enhanced API Client (manifold_client.py):
+   - Retry logic with exponential backoff (using tenacity)
+   - Better error handling and recovery
+   - Rate limiting awareness
+   - Connection pooling for efficiency
+   - Input validation
+
+2. Modular Architecture:
+   - Separation of concerns (analysis, strategies, risk, performance)
+   - Pluggable strategy system
+   - Reusable components
+
+3. Advanced Features:
+   - LLM-powered market analysis
+   - Multi-factor market scoring
+   - Portfolio-level risk management
+   - Market resolution tracking with accurate P&L
+   - Composite strategy system
+
+4. Production-Ready:
+   - Comprehensive error handling
+   - Logging throughout
+   - Configuration management
+   - Performance tracking
 """
 import asyncio
 import logging
@@ -12,6 +39,8 @@ from llm_analyzer import LLMAnalyzer
 from strategies import LLMStrategy, CompositeStrategy, KellyStrategy
 from risk_manager import RiskManager
 from performance_tracker import PerformanceTracker
+from market_resolution_tracker import MarketResolutionTracker
+from performance_display import PerformanceDisplay
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +87,8 @@ class JudgmentalPredictionBot:
         )
         
         self.performance_tracker = PerformanceTracker()
+        self.resolution_tracker = MarketResolutionTracker()
+        self.display = PerformanceDisplay()
         
         # Initialize Manifold API client
         self._init_manifold_client()
@@ -65,22 +96,32 @@ class JudgmentalPredictionBot:
         self.running = False
     
     def _init_manifold_client(self):
-        """Initialize Manifold API client."""
+        """
+        Initialize Manifold API client.
+        Improves upon manifoldbot by:
+        - Using enhanced client with retry logic
+        - Better error handling
+        - Fallback to manifoldbot if available
+        """
         try:
-            # Try to use our custom client first
+            # Use our enhanced client (improves upon manifoldbot patterns)
             from manifold_client import ManifoldClient
-            self.manifold = ManifoldClient(api_key=self.config.manifold_api_key)
-            logger.info("Manifold client initialized (custom)")
+            self.manifold = ManifoldClient(
+                api_key=self.config.manifold_api_key,
+                timeout=30,
+                max_retries=3
+            )
+            logger.info("Manifold client initialized (enhanced - improves upon manifoldbot)")
         except ImportError:
             try:
                 # Fallback to manifoldbot if available
                 from manifoldbot import ManifoldClient as MBClient
                 self.manifold = MBClient(api_key=self.config.manifold_api_key)
-                logger.info("Manifold client initialized (manifoldbot)")
+                logger.info("Manifold client initialized (manifoldbot - basic)")
+                logger.warning("Using basic manifoldbot client. Enhanced features unavailable.")
             except ImportError:
-                logger.error("Neither custom client nor manifoldbot available. Using custom client.")
-                from manifold_client import ManifoldClient
-                self.manifold = ManifoldClient(api_key=self.config.manifold_api_key)
+                logger.error("Neither enhanced client nor manifoldbot available.")
+                raise ImportError("manifold_client module not found and manifoldbot not installed")
         except Exception as e:
             logger.error(f"Error initializing Manifold client: {e}")
             raise
@@ -120,7 +161,7 @@ class JudgmentalPredictionBot:
             logger.error(f"Error fetching balance: {e}")
             return 0.0
     
-    async def place_bet(self, market_id: str, amount: float, side: str) -> bool:
+    async def place_bet(self, market_id: str, amount: float, side: str, market: Optional[Dict] = None) -> bool:
         """
         Place a bet on a market.
         
@@ -128,10 +169,19 @@ class JudgmentalPredictionBot:
             market_id: Market ID
             amount: Bet amount
             side: 'YES' or 'NO'
+            market: Optional market dict for validation
             
         Returns:
             True if bet was placed successfully
         """
+        # Final safety check: Verify market is from target creator before placing bet
+        if market:
+            creator = market.get("creatorUsername") or market.get("creatorId")
+            if creator != self.config.target_creator:
+                logger.error(f"BLOCKED: Attempted to bet on market {market_id} from creator '{creator}', "
+                           f"but target creator is '{self.config.target_creator}'")
+                return False
+        
         try:
             outcome = "YES" if side == "YES" else "NO"
             loop = asyncio.get_event_loop()
@@ -143,7 +193,7 @@ class JudgmentalPredictionBot:
                     outcome=outcome
                 )
             )
-            logger.info(f"Placed {side} bet of {amount:.2f} on market {market_id}")
+            logger.info(f"Placed {side} bet of {amount:.2f} on market {market_id} (Creator: {self.config.target_creator})")
             return True
         except Exception as e:
             logger.error(f"Error placing bet: {e}")
@@ -171,7 +221,22 @@ class JudgmentalPredictionBot:
         balance = await self.get_user_balance()
         self.performance_tracker.update_balance(balance)
         
-        # Process each market
+        # Check for resolved markets first (only from target creator)
+        for market in target_markets:
+            # Safety check: Only process markets from target creator
+            creator = market.get("creatorUsername") or market.get("creatorId")
+            if creator != self.config.target_creator:
+                continue
+                
+            resolution = self.resolution_tracker.check_resolution(market)
+            if resolution:
+                # Update performance tracker with resolution
+                logger.info(f"Market resolved: {resolution['market_question'][:50]}... "
+                          f"{'WON' if resolution['won'] else 'LOST'} - P&L: {resolution['pnl']:.2f}")
+                # Remove from risk manager
+                self.risk_manager.remove_position(market.get("id"))
+        
+        # Process each market for new trades
         for market in target_markets:
             if not self.running:
                 break
@@ -188,6 +253,12 @@ class JudgmentalPredictionBot:
         """
         market_id = market.get("id")
         market_question = market.get("question", "Unknown")
+        
+        # Safety check: Only process markets from target creator
+        creator = market.get("creatorUsername") or market.get("creatorId")
+        if creator != self.config.target_creator:
+            logger.warning(f"Skipping market {market_id}: Creator '{creator}' is not '{self.config.target_creator}'")
+            return
         
         # Skip if already resolved
         if market.get("isResolved", False):
@@ -231,13 +302,22 @@ class JudgmentalPredictionBot:
             logger.debug(f"Bet amount {bet_amount:.2f} too small")
             return
         
-        # Place bet
-        success = await self.place_bet(market_id, bet_amount, side)
+        # Place bet (pass market for final validation)
+        success = await self.place_bet(market_id, bet_amount, side, market)
         
         if success:
             # Record position and trade
             current_prob = market.get("probability", 0.5)
             self.risk_manager.record_position(market_id, bet_amount, side, current_prob)
+            
+            # Track for resolution
+            self.resolution_tracker.track_position(
+                market_id=market_id,
+                side=side,
+                amount=bet_amount,
+                entry_prob=current_prob,
+                market_question=market_question
+            )
             
             reasoning = llm_prediction[2] if llm_prediction else "Strategy-based"
             self.performance_tracker.record_trade(
@@ -258,9 +338,13 @@ class JudgmentalPredictionBot:
     
     async def run(self):
         """Run the bot continuously."""
-        logger.info("Starting judgmental prediction bot...")
-        logger.info(f"Target creator: {self.config.target_creator}")
-        logger.info(f"Bot username: {self.config.manifold_username}")
+        logger.info("=" * 60)
+        logger.info("Judgmental Prediction Bot - Contest Entry")
+        logger.info("=" * 60)
+        logger.info(f"Target creator: {self.config.target_creator} (https://manifold.markets/{self.config.target_creator})")
+        logger.info(f"Designated bot username: {self.config.manifold_username}")
+        logger.info(f"Bot will ONLY trade in markets created by: {self.config.target_creator}")
+        logger.info("=" * 60)
         
         self.running = True
         
@@ -268,8 +352,37 @@ class JudgmentalPredictionBot:
             while self.running:
                 await self.run_once()
                 
-                # Print performance summary
-                self.performance_tracker.print_summary()
+                # Get resolution metrics
+                resolution_metrics = self.resolution_tracker.get_performance_metrics()
+                
+                # Get performance stats
+                stats = self.performance_tracker.get_statistics(resolution_metrics)
+                
+                # Get portfolio summary
+                portfolio_summary = self.risk_manager.get_portfolio_summary()
+                
+                # Get bot info
+                bot_info = {
+                    "target_creator": self.config.target_creator,
+                    "username": self.config.manifold_username,
+                    "status": "Running" if self.running else "Stopped"
+                }
+                
+                # Display beautiful performance dashboard
+                self.display.display_performance(
+                    stats=stats,
+                    resolution_metrics=resolution_metrics,
+                    portfolio_summary=portfolio_summary,
+                    bot_info=bot_info
+                )
+                
+                # Also log summary for log file
+                logger.info(f"Performance - Trades: {stats['total_trades']}, "
+                          f"P&L: ${stats['total_pnl']:.2f}, ROI: {stats['roi']:.2f}%")
+                if resolution_metrics["total_resolved"] > 0:
+                    logger.info(f"Resolved: {resolution_metrics['total_resolved']} "
+                              f"(Wins: {resolution_metrics['wins']}, Losses: {resolution_metrics['losses']}, "
+                              f"Win Rate: {resolution_metrics['win_rate']:.1f}%)")
                 
                 # Wait before next iteration
                 logger.info(f"Waiting {self.config.check_interval} seconds before next check...")
